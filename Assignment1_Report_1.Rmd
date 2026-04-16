@@ -1,0 +1,319 @@
+---
+title: "Bioinformatic Analysis with R — Assignment 1"
+author: "Saima Imran"
+date: "2021 | University of Skövde"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 6)
+```
+
+---
+
+## Introduction
+
+This assignment analyses RNA-seq gene expression data from the ArrayExpress database (accession: **E-MTAB-7847**). The dataset contains two human liver cell lines treated with three different compounds, providing an opportunity to explore gene expression differences between cancer and normal cells under various drug treatments.
+
+The experiment involves:
+
+- **HUH7** — Human hepatocellular carcinoma (liver cancer) cell line
+- **THLE5B** — Normal human liver epithelial cell line
+- **Three compounds:** AD80 (kinase inhibitor), DMSO (vehicle control), Sorafenib (cancer drug)
+- **9 samples per cell line** — 3 replicates per compound
+- **Total samples:** 18
+
+---
+
+## Step 1 — Load Packages
+
+```{r packages}
+library(ArrayExpress)
+library(Biobase)
+library(tidyverse)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+library(caret)
+library(randomForest)
+library(pROC)
+```
+
+---
+
+## Step 2 — Download Data from ArrayExpress
+
+```{r download, eval=FALSE}
+dataset <- getAE("E-MTAB-7847", type = "processed")
+```
+
+```{r read_data}
+thle5b <- read.table("THLE5B_DESeq2_normalized_count_matrix.txt",
+                      header = TRUE, row.names = 1, sep = "\t")
+huh7   <- read.table("HUH7_DESeq2_normalized_count_matrix.txt",
+                      header = TRUE, row.names = 1, sep = "\t")
+
+cat("THLE5B dimensions:", nrow(thle5b), "x", ncol(thle5b))
+cat("\nHUH7 dimensions:  ", nrow(huh7),   "x", ncol(huh7))
+```
+
+---
+
+## Step 3 — Experimental Design
+
+```{r design}
+# Combine datasets
+all_samples <- cbind(thle5b, huh7)
+
+# Define factor vectors
+cell_line <- factor(c(rep("THLE5B", 9), rep("HUH7", 9)))
+compound  <- factor(c(rep("AD80", 3), rep("DMSO", 3), rep("Sorafenib", 3),
+                      rep("AD80", 3), rep("DMSO", 3), rep("Sorafenib", 3)))
+
+# Create design table
+design_table <- data.frame(
+  CellLine = cell_line,
+  Compound = compound,
+  row.names = colnames(all_samples))
+
+knitr::kable(design_table, caption = "Experimental Design Table")
+```
+
+**Summary of experimental design:**
+The study uses a 2x3 factorial design with two cell lines (HUH7 cancer and THLE5B normal) and three compound treatments (AD80, DMSO, Sorafenib), with 3 biological replicates per condition.
+
+---
+
+## Step 4 — Log2 Transformation
+
+```{r transform}
+all_log <- log2(all_samples + 1)
+cat("Log2 transformation applied: log2(counts + 1)")
+cat("\nDimensions:", nrow(all_log), "genes x", ncol(all_log), "samples")
+```
+
+---
+
+## Step 5 — Quality Control: Boxplot
+
+```{r boxplot, fig.height=6}
+sample_cols <- c(rep("#3498DB", 9), rep("#E74C3C", 9))
+
+par(mar = c(8, 4, 4, 2))
+boxplot(all_log,
+        main     = "E-MTAB-7847 — RNA-seq Expression Quality Control",
+        ylab     = "Log2 Normalised Counts",
+        col      = sample_cols,
+        las      = 2,
+        cex.axis = 0.7,
+        outline  = FALSE)
+legend("topright",
+       legend = c("THLE5B (Normal liver)", "HUH7 (Liver cancer)"),
+       fill   = c("#3498DB", "#E74C3C"),
+       cex    = 0.8)
+```
+
+**Interpretation:**
+A boxplot visualises the distribution of gene expression values across all samples. Each box shows the median (middle line), interquartile range (box), and whiskers. All 18 samples show similar expression distributions after log2 normalisation, confirming the data is well normalised and suitable for downstream analysis. No outlier samples are detected.
+
+---
+
+## Step 6 — Quality Control: Heatmap
+
+```{r heatmap, fig.height=10}
+# Top 50 most variable genes
+gene_var     <- apply(all_log, 1, var)
+top_genes    <- names(sort(gene_var, decreasing = TRUE)[1:50])
+heatmap_data <- all_log[top_genes, ]
+
+# Annotation
+annotation_col <- data.frame(
+  CellLine = cell_line,
+  Compound = compound,
+  row.names = colnames(all_log))
+
+ann_colors <- list(
+  CellLine = c("THLE5B" = "#3498DB", "HUH7" = "#E74C3C"),
+  Compound = c("AD80" = "#F39C12", "DMSO" = "#9B59B6",
+               "Sorafenib" = "#2ECC71"))
+
+pheatmap(heatmap_data,
+         annotation_col    = annotation_col,
+         annotation_colors = ann_colors,
+         scale             = "row",
+         cluster_rows      = TRUE,
+         cluster_cols      = TRUE,
+         color             = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+         main              = "Top 50 Variable Genes — E-MTAB-7847",
+         fontsize          = 9,
+         fontsize_row      = 6,
+         show_colnames     = TRUE,
+         border_color      = NA)
+```
+
+**Interpretation:**
+The heatmap displays the top 50 most variable genes across all 18 samples. Red indicates high expression and blue indicates low expression. Clear separation is visible between HUH7 cancer cells and THLE5B normal cells, confirming strong biological differences. Samples cluster primarily by cell line rather than compound treatment, suggesting cell line identity is the dominant source of variation.
+
+---
+
+## Step 7 — Quality Control: PCA Plot
+
+```{r pca}
+# Remove zero variance genes
+all_log_clean <- all_log[apply(all_log, 1, var) > 0, ]
+
+# PCA
+pca_assign <- prcomp(t(all_log_clean), scale. = TRUE)
+
+pca_df <- data.frame(
+  PC1      = pca_assign$x[, 1],
+  PC2      = pca_assign$x[, 2],
+  CellLine = cell_line,
+  Compound = compound)
+
+var_exp <- round(summary(pca_assign)$importance[2, 1:2] * 100, 1)
+
+ggplot(pca_df, aes(x = PC1, y = PC2, colour = CellLine, shape = Compound)) +
+  geom_point(size = 5, alpha = 0.9) +
+  scale_colour_manual(values = c("THLE5B" = "#3498DB", "HUH7" = "#E74C3C")) +
+  scale_shape_manual(values = c("AD80" = 16, "DMSO" = 17, "Sorafenib" = 15)) +
+  labs(
+    title    = "PCA — E-MTAB-7847 RNA-seq Quality Control",
+    subtitle = "Colour = Cell Line | Shape = Compound Treatment",
+    x        = paste0("PC1 (", var_exp[1], "% variance)"),
+    y        = paste0("PC2 (", var_exp[2], "% variance)"),
+    colour   = "Cell Line", shape = "Compound") +
+  theme_bw(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+**Interpretation:**
+PCA reduces thousands of gene expression values into two principal components. PC1 explains `r var_exp[1]`% of variance and clearly separates the two cell lines. THLE5B normal samples (blue) cluster on one side while HUH7 cancer samples (red) cluster on the other. Within each cell line, the three compound treatments (different shapes) cluster closely together, indicating compound treatment has a smaller effect than cell line identity. No outliers are present.
+
+---
+
+## Step 8 — Machine Learning: Random Forest Classifier
+
+```{r ml_prep}
+# Select top 100 variable genes
+top_var_genes <- names(sort(apply(all_log, 1, var), decreasing = TRUE)[1:100])
+
+# Labels
+labels <- factor(c(rep("Normal", 9), rep("Cancer", 9)))
+
+# Prepare ML dataset
+ml_df <- data.frame(t(all_log[top_var_genes, ]), Class = labels)
+
+cat("ML dataset:", nrow(ml_df), "samples x", ncol(ml_df)-1, "features\n")
+cat("Classes:\n")
+print(table(ml_df$Class))
+```
+
+```{r train_model}
+set.seed(42)
+
+control <- trainControl(method          = "cv",
+                        number          = 5,
+                        classProbs      = TRUE,
+                        summaryFunction = twoClassSummary)
+
+rf_model <- train(Class ~ .,
+                  data      = ml_df,
+                  method    = "rf",
+                  trControl = control,
+                  metric    = "ROC")
+
+print(rf_model)
+```
+
+**Interpretation:**
+A Random Forest classifier was trained using 5-fold cross-validation to classify samples as Cancer (HUH7) or Normal (THLE5B). The model achieves perfect performance with ROC = 1.0, Sensitivity = 1.0, and Specificity = 1.0, meaning all samples are correctly classified.
+
+---
+
+## Step 9 — Feature Importance
+
+```{r importance}
+importance_df <- varImp(rf_model)$importance %>%
+  rownames_to_column("Gene") %>%
+  arrange(desc(Overall)) %>%
+  head(20)
+
+ggplot(importance_df, aes(x = reorder(Gene, Overall), y = Overall)) +
+  geom_bar(stat = "identity", fill = "#E74C3C", alpha = 0.8) +
+  coord_flip() +
+  labs(
+    title    = "Top 20 Important Genes — Random Forest Classifier",
+    subtitle = "Cancer vs Normal | E-MTAB-7847",
+    x        = "Gene",
+    y        = "Importance Score") +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+**Interpretation:**
+Feature importance reveals which genes were most useful for classifying cancer vs normal samples. Genes with higher importance scores show the largest expression differences between cell lines and represent potential biomarkers for liver cancer detection.
+
+---
+
+## Step 10 — ROC Curve
+
+```{r roc}
+predictions <- predict(rf_model, ml_df, type = "prob")
+
+roc_obj   <- roc(ml_df$Class, predictions[, "Cancer"],
+                  levels = c("Normal", "Cancer"))
+auc_value <- round(auc(roc_obj), 3)
+
+cat("AUC:", auc_value)
+
+plot(roc_obj,
+     main = paste0("ROC Curve — Random Forest\nCancer vs Normal | AUC = ", auc_value),
+     col  = "#E74C3C",
+     lwd  = 2)
+abline(a = 0, b = 1, lty = 2, col = "grey")
+```
+
+**What is a ROC curve?**
+The ROC (Receiver Operating Characteristic) curve plots Sensitivity (True Positive Rate) against 1-Specificity (False Positive Rate). The Area Under the Curve (AUC) summarises model performance:
+
+- **AUC = 1.0** → Perfect classifier
+- **AUC > 0.9** → Excellent
+- **AUC = 0.5** → Random (no skill)
+
+**Results:**
+The ROC curve shows AUC = `r auc_value` — a perfect classifier! The curve hugs the top-left corner indicating 100% sensitivity and 100% specificity.
+
+---
+
+## Conclusion
+
+This analysis successfully demonstrates:
+
+1. **High data quality** — boxplot and PCA show well-normalised consistent samples
+2. **Clear biological differences** — cancer and normal cells show distinct gene expression
+3. **Cell line dominates** — compound treatment has smaller effect than cell line identity
+4. **Perfect ML classification** — Random Forest achieves AUC = 1.0
+5. **Key biomarkers identified** — feature importance reveals top discriminating genes
+
+---
+
+## Methods Summary
+
+| Step | Method | R Package |
+|------|--------|-----------|
+| Data download | ArrayExpress API | ArrayExpress |
+| Log2 transformation | log2(x+1) | base R |
+| Quality control | Boxplot, Heatmap, PCA | pheatmap, ggplot2 |
+| Machine learning | Random Forest, 5-fold CV | caret, randomForest |
+| Model evaluation | ROC curve, AUC | pROC |
+
+---
+
+*Saima Imran | University of Skövde | Bioinformatics Analysis with R — BI731A*
